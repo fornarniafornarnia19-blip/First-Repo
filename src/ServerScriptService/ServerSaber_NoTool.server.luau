@@ -1,290 +1,277 @@
--- ServerScriptService/SaberServer_NoTool.server.lua
+--!strict
+-- ServerScriptService/ServerSaber_NoTool.server.lua
+
 local Players = game:GetService("Players")
-local RS = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
 
-local MODEL_NAME: string = "Lightsaber" -- Model in ReplicatedStorage
-local TOGGLE_EVENT = RS:WaitForChild("SaberToggle") :: RemoteEvent
+-- We do NOT WaitForChild here. We boot when the folder actually exists.
+local SABER_FOLDERS: { string } = { "SaberHilt", "Saber" }
 
--- Placement offsets (tweak to taste)
-local HAND_OFFSET = CFrame.new(0, -0.2, 0) * CFrame.Angles(0, math.rad(90), math.rad(270)) -- in-hand orientation
-local WAIST_OFFSET = CFrame.new(1, -0.5, -0.5) * CFrame.Angles(0, math.rad(90), math.rad(180))
+local function bootWithFolder(saberFolder: Folder)
+	-- === Modules (explicit) ===
+	local RemotesModule = saberFolder:WaitForChild("Remotes") :: ModuleScript
+	local StateModule = saberFolder:WaitForChild("State") :: ModuleScript
+	local NoToolModule = saberFolder:WaitForChild("NoTool") :: ModuleScript
+	local RigModule = saberFolder:WaitForChild("Rig") :: ModuleScript
+	local EquipAnimModule = saberFolder:WaitForChild("EquipAnim") :: ModuleScript
 
--- Debouncers
-local creatingHip = setmetatable({}, { __mode = "k" })
-local creatingHand = setmetatable({}, { __mode = "k" })
+	local Remotes = (require :: any)(RemotesModule)
+	local State = (require :: any)(StateModule)
+	local NoTool = (require :: any)(NoToolModule)
+	local Rig = (require :: any)(RigModule)
+	local EquipAnim = (require :: any)(EquipAnimModule)
 
--- ========== helpers ==========
+	-- Audio is optional in this pack; try local first, then ServerStorage.Saber
+	local AudioModule: ModuleScript? = (saberFolder:FindFirstChild("Audio") :: ModuleScript?)
+		or (
+			ServerStorage:FindFirstChild("Saber") and (ServerStorage.Saber:FindFirstChild("Audio") :: ModuleScript?)
+			or nil
+		)
+	local Audio: any = AudioModule and (require :: any)(AudioModule) or nil
 
-local function weldUpModel(model: Model)
-	local handleInst = model:FindFirstChild("Handle", true)
-	assert(handleInst and handleInst:IsA("BasePart"), "Lightsaber model needs a BasePart named 'Handle'")
-	local handle = handleInst :: BasePart
-	model.PrimaryPart = handle
+	-- debounce per-character
+	local toggling: { [Model]: boolean } = setmetatable({}, { __mode = "k" }) :: any
 
-	for _, d in ipairs(model:GetDescendants()) do
-		if d:IsA("BasePart") and d ~= handle then
-			d.Anchored = false
-			d.CanCollide = false
-			d.Massless = true
-			local w = Instance.new("WeldConstraint")
-			w.Part0 = handle
-			w.Part1 = d
-			w.Parent = handle
+	-- ===== Audio helpers (server-only) =====
+	local attachedModel: { [Model]: Model? } = setmetatable({}, { __mode = "k" }) :: any
+
+	local function getCosmeticsFolder(character: Model): Folder?
+		local f = character:FindFirstChild("cosmetics") or character:FindFirstChild("Cosmetics")
+		if f and f:IsA("Folder") then
+			return f
 		end
-	end
-	handle.Anchored = false
-	handle.CanCollide = false
-	handle.Massless = true
-end
-
-local function cloneSaber(): Model
-	local srcInst = RS:FindFirstChild(MODEL_NAME)
-	assert(srcInst and srcInst:IsA("Model"), ("Missing %s in ReplicatedStorage"):format(MODEL_NAME))
-	local src = srcInst :: Model
-	local m = src:Clone()
-	weldUpModel(m)
-	return m
-end
-
-local function getWaistBase(character: Model): BasePart?
-	local part = character:FindFirstChild("LowerTorso")
-		or character:FindFirstChild("Torso")
-		or character:FindFirstChild("HumanoidRootPart")
-	if part and part:IsA("BasePart") then
-		return part
-	end
-	return nil
-end
-
-local function getHandBase(character: Model): BasePart?
-	local part = character:FindFirstChild("RightHand") or character:FindFirstChild("Right Arm")
-	if part and part:IsA("BasePart") then
-		return part
-	end
-	return nil
-end
-
--- ========== HIP HILT ==========
-
-local function destroyHip(character: Model)
-	local hip = character and character:FindFirstChild("HipHilt", true)
-	if hip and hip:IsA("Model") then
-		hip:Destroy()
-	end
-end
-
-local function ensureHip(character: Model): Model?
-	if not character or not character.Parent then
-		return nil
+		f = character:FindFirstChild("cosmetics", true) or character:FindFirstChild("Cosmetics", true)
+		return (f and f:IsA("Folder")) and f or nil
 	end
 
-	local base = getWaistBase(character)
-	if not base then
-		return nil
-	end
-
-	do
-		local existingInst = character:FindFirstChild("HipHilt", true)
-		if existingInst and existingInst:IsA("Model") then
-			local existing = existingInst :: Model
-			local handle = existing.PrimaryPart
-			if handle then
-				local okWeld = handle:FindFirstChild("HipWeld")
-				if okWeld and okWeld:IsA("Weld") then
-					local w = okWeld :: Weld
-					if w.Part0 == base then
-						return existing
-					end
-				end
+	local function getHandSaber(character: Model): Model?
+		local cos = getCosmeticsFolder(character)
+		if cos then
+			local m = cos:FindFirstChild("HandSaber") or cos:FindFirstChild("Hand Saber")
+			if m and m:IsA("Model") then
+				return m
 			end
-			existing:Destroy()
 		end
+		local any = character:FindFirstChild("HandSaber", true) or character:FindFirstChild("Hand Saber", true)
+		return (any and any:IsA("Model")) and any or nil
 	end
 
-	if creatingHip[character] then
-		task.wait(0.1)
-		local again = character:FindFirstChild("HipHilt", true)
-		return (again and again:IsA("Model")) and (again :: Model) or nil
-	end
-	creatingHip[character] = true
-
-	local ok, result = pcall(function(): Model
-		local m = cloneSaber()
-		m.Name = "HipHilt"
-		-- hide blade on hip
-		local bladeInst = m:FindFirstChild("Blade", true)
-		if bladeInst and bladeInst:IsA("BasePart") then
-			local blade = bladeInst :: BasePart
-			blade.Transparency = 1
-			blade.CanCollide = false
-		end
-
-		local cosmeticsInst = character:FindFirstChild("Cosmetics")
-		local cosmetics: Folder
-		if cosmeticsInst and cosmeticsInst:IsA("Folder") then
-			cosmetics = cosmeticsInst
+	-- strict-safe: never mutate a BoolValue? directly
+	local function getBladeOn(character: Model): BoolValue
+		-- pick/create the state folder
+		local folder: Instance
+		if State.getFolder then
+			folder = State.getFolder(character)
 		else
-			cosmetics = Instance.new("Folder")
-			cosmetics.Name = "Cosmetics"
-			cosmetics.Parent = character
-		end
-
-		m.Parent = cosmetics
-
-		local handle = m.PrimaryPart
-		assert(handle, "HipHilt clone missing PrimaryPart after weldUpModel")
-		handle.CFrame = base.CFrame * WAIST_OFFSET
-
-		local weld = Instance.new("Weld")
-		weld.Name = "HipWeld"
-		weld.Part0 = base
-		weld.Part1 = handle
-		weld.C0 = base.CFrame:ToObjectSpace(handle.CFrame)
-		weld.C1 = CFrame.new()
-		weld.Parent = handle
-		return m
-	end)
-
-	creatingHip[character] = nil
-	if ok then
-		return result :: Model
-	else
-		warn("[Saber] ensureHip failed:", result)
-		return nil
-	end
-end
-
--- ========== HAND SABER ==========
-
-local function destroyHand(character: Model)
-	local hand = character and character:FindFirstChild("HandSaber", true)
-	if hand and hand:IsA("Model") then
-		hand:Destroy()
-	end
-end
-
-local function ensureHand(character: Model): Model?
-	if not character or not character.Parent then
-		return nil
-	end
-
-	local base = getHandBase(character)
-	if not base then
-		return nil
-	end
-
-	do
-		local existingInst = character:FindFirstChild("HandSaber", true)
-		if existingInst and existingInst:IsA("Model") then
-			local existing = existingInst :: Model
-			local handle = existing.PrimaryPart
-			if handle then
-				local okWeld = handle:FindFirstChild("HandWeld")
-				if okWeld and okWeld:IsA("Weld") then
-					local w = okWeld :: Weld
-					if w.Part0 == base then
-						return existing
-					end
-				end
+			local existingFolder = character:FindFirstChild("SaberState")
+			if existingFolder and existingFolder:IsA("Folder") then
+				folder = existingFolder
+			else
+				local f = Instance.new("Folder")
+				f.Name = "SaberState"
+				f.Parent = character
+				folder = f
 			end
-			existing:Destroy()
+		end
+
+		-- reuse if present
+		local existing = folder:FindFirstChild("BladeOn")
+		if existing and existing:IsA("BoolValue") then
+			return existing
+		end
+
+		-- create fresh (use concrete local, then return)
+		local bb = Instance.new("BoolValue")
+		bb.Name = "BladeOn"
+		bb.Value = false
+		bb.Parent = folder
+		return bb
+	end
+
+	local function destroyAudio(character: Model)
+		if not Audio then
+			return
+		end
+		local hand = attachedModel[character]
+		if hand then
+			Audio.stopForModel(hand)
+			Audio.destroyForModel(hand)
+			attachedModel[character] = nil
 		end
 	end
 
-	if creatingHand[character] then
-		task.wait(0.1)
-		local again = character:FindFirstChild("HandSaber", true)
-		return (again and again:IsA("Model")) and (again :: Model) or nil
-	end
-	creatingHand[character] = true
-
-	local ok, result = pcall(function(): Model
-		local m = cloneSaber()
-		m.Name = "HandSaber"
-		-- show blade in hand
-		local bladeInst = m:FindFirstChild("Blade", true)
-		if bladeInst and bladeInst:IsA("BasePart") then
-			(bladeInst :: BasePart).Transparency = 0
+	local function attachAudioIfPossible(character: Model)
+		if not Audio then
+			return
+		end
+		local hand = getHandSaber(character)
+		if not hand then
+			return
+		end
+		if attachedModel[character] == hand then
+			return
 		end
 
-		m.Parent = character
+		local prev = attachedModel[character]
+		if prev and prev ~= hand then
+			Audio.destroyForModel(prev)
+		end
+		attachedModel[character] = hand
 
-		local handle = m.PrimaryPart
-		assert(handle, "HandSaber clone missing PrimaryPart after weldUpModel")
-		handle.CFrame = base.CFrame * HAND_OFFSET
+		hand.AncestryChanged:Connect(function(_, parent)
+			if parent == nil and attachedModel[character] == hand then
+				attachedModel[character] = nil
+			end
+		end)
 
-		local weld = Instance.new("Weld")
-		weld.Name = "HandWeld"
-		weld.Part0 = base
-		weld.Part1 = handle
-		weld.C0 = base.CFrame:ToObjectSpace(handle.CFrame)
-		weld.C1 = CFrame.new()
-		weld.Parent = handle
-		return m
-	end)
+		local bladeOn = getBladeOn(character)
+		Audio.attachFromModel(hand, bladeOn)
 
-	creatingHand[character] = nil
-	if ok then
-		return result :: Model
-	else
-		warn("[Saber] ensureHand failed:", result)
-		return nil
-	end
-end
-
--- ========== state + toggle ==========
-
-local function isEquipped(character: Model): boolean
-	local inst = character:FindFirstChild("HandSaber", true)
-	return inst ~= nil and inst:IsA("Model")
-end
-
-local function equip(character: Model)
-	destroyHip(character)
-	ensureHand(character)
-end
-
-local function unequip(character: Model)
-	destroyHand(character)
-	ensureHip(character)
-end
-
-local function toggle(player: Player)
-	local char = player.Character
-	if not char then
-		return
-	end
-	if isEquipped(char) then
-		unequip(char)
-	else
-		equip(char)
-	end
-end
-
--- ========== wiring ==========
-
-TOGGLE_EVENT.OnServerEvent:Connect(toggle)
-
-local function onCharacterAdded(character: Model)
-	task.defer(function()
-		-- start with a hip hilt
-		destroyHand(character)
-		ensureHip(character)
-
-		-- clean up on death
-		local hum = character:FindFirstChildOfClass("Humanoid")
-		if hum then
-			hum.Died:Once(function()
-				destroyHand(character)
-				destroyHip(character)
+		if bladeOn.Value then
+			task.delay(0.05, function()
+				if hand.Parent then
+					Audio.forceApply(hand, true)
+				end
 			end)
 		end
-	end)
+	end
+
+	-- ===== equip/unequip toggle =====
+	local function equip(character: Model, player: Player)
+		State.setIgnited(character, false)
+		State.setBladeOn(character, false)
+		EquipAnim.play(character, "SwapToHand", player)
+
+		task.defer(function()
+			for _ = 1, 30 do -- ~1s max
+				if getHandSaber(character) then
+					break
+				end
+				task.wait(0.033)
+			end
+			attachAudioIfPossible(character)
+		end)
+	end
+
+	local function unequip(character: Model, player: Player)
+		NoTool.setDisignited(character)
+		destroyAudio(character)
+		EquipAnim.play(character, "SwapToHip", player)
+		-- removed State.getBladeOn/State.setBladeOn
+	end
+
+	local function onToggle(player: Player)
+		local char = player.Character
+		if not char or toggling[char] or EquipAnim.isPlaying(char) then
+			return
+		end
+		toggling[char] = true
+		task.defer(function()
+			toggling[char] = nil
+		end)
+
+		if Rig.isEquipped(char) then
+			unequip(char, player)
+		else
+			equip(char, player)
+		end
+	end
+
+	Remotes.Toggle.OnServerEvent:Connect(onToggle)
+
+	-- ===== spawn handling =====
+	local function spawnHolstered(character: Model)
+		Rig.destroyHand(character)
+		Rig.ensureHip(character)
+		State.setIgnited(character, false)
+		State.setBladeOn(character, false)
+		EquipAnim.stop(character)
+		destroyAudio(character)
+	end
+
+	local function onCharacterAdded(p: Player, character: Model)
+		task.defer(function()
+			if character.Parent then
+				spawnHolstered(character)
+			end
+
+			local cos = getCosmeticsFolder(character)
+			if cos then
+				cos.ChildAdded:Connect(function(ch)
+					if ch:IsA("Model") and (ch.Name == "HandSaber" or ch.Name == "Hand Saber") then
+						attachAudioIfPossible(character)
+					end
+				end)
+				cos.ChildRemoved:Connect(function(ch)
+					if ch:IsA("Model") and (ch.Name == "HandSaber" or ch.Name == "Hand Saber") then
+						destroyAudio(character)
+					end
+				end)
+			end
+
+			character.ChildAdded:Connect(function(ch)
+				if ch:IsA("Model") and (ch.Name == "HandSaber" or ch.Name == "Hand Saber") then
+					attachAudioIfPossible(character)
+				end
+			end)
+			character.ChildRemoved:Connect(function(ch)
+				if ch:IsA("Model") and (ch.Name == "HandSaber" or ch.Name == "Hand Saber") then
+					destroyAudio(character)
+				end
+			end)
+
+			local hum = character:FindFirstChildOfClass("Humanoid")
+			if hum then
+				hum.Died:Once(function()
+					EquipAnim.stop(character)
+					NoTool.setDisignited(character)
+					Rig.destroyHand(character)
+					Rig.destroyHip(character)
+					destroyAudio(character)
+				end)
+			end
+		end)
+	end
+
+	local function wirePlayer(plr: Player)
+		plr.CharacterAdded:Connect(function(char)
+			onCharacterAdded(plr, char)
+		end)
+		if plr.Character then
+			onCharacterAdded(plr, plr.Character)
+		end
+	end
+
+	Players.PlayerAdded:Connect(wirePlayer)
+	for _, plr in ipairs(Players:GetPlayers()) do
+		wirePlayer(plr)
+	end
 end
 
-Players.PlayerAdded:Connect(function(p: Player)
-	p.CharacterAdded:Connect(onCharacterAdded)
-	if p.Character then
-		onCharacterAdded(p.Character)
+-- Try immediate boot if the folder already exists
+local booted = false
+for i = 1, #SABER_FOLDERS do
+	local name = SABER_FOLDERS[i]
+	local inst = ServerStorage:FindFirstChild(name)
+	if inst and inst:IsA("Folder") then
+		bootWithFolder(inst :: Folder)
+		booted = true
+		break
 	end
-end)
+end
+
+-- If not found yet, boot when it appears later (no blocking)
+if not booted then
+	ServerStorage.ChildAdded:Connect(function(child: Instance)
+		if child:IsA("Folder") then
+			for i = 1, #SABER_FOLDERS do
+				local name = SABER_FOLDERS[i]
+				if child.Name == name and not booted then
+					bootWithFolder(child :: Folder)
+					booted = true
+					break
+				end
+			end
+		end
+	end)
+end
